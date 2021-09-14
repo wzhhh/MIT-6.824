@@ -14,6 +14,14 @@ import "strconv"
 // and reply for an RPC.
 //
 
+const (
+	_ int8 = iota
+	MapPhase
+	ReducePhase
+	Wait
+	Exit
+)
+
 type ExampleArgs struct {
 	X int
 }
@@ -23,6 +31,31 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type MRRequest struct {
+	TaskDone bool
+	Phase int8
+	Output string
+}
+
+type MRResponse struct {
+	Task *Task
+	ID int
+}
+
+type MapDone struct {
+	MapID int
+}
+
+type Task struct {
+	Phase int8
+	MapFile string
+	MapID int
+	Nmap int
+	ReduceID int
+	NReduce int
+	ReduceFiles []string
+}
+
 
 
 // Cook up a unique-ish UNIX-domain socket name
