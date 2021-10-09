@@ -14,12 +14,14 @@ import "time"
 import "math/rand"
 import "sync/atomic"
 import "sync"
+import "log"
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
 const RaftElectionTimeout = 1000 * time.Millisecond
 
 func TestInitialElection2A(t *testing.T) {
+	log.Println("Test (2A) start")
 	servers := 3
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -103,6 +105,52 @@ func TestReElection2A(t *testing.T) {
 	cfg.checkOneLeader()
 	_, _ = DPrintf("Test (2A) check last node shouldn't prevent leader from existing ok")
 	_, _ = DPrintf("--------------")
+
+	cfg.end()
+}
+
+func TestManyElections2A(t *testing.T) {
+	servers := 7
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	cfg.begin("Test (2A): multiple elections")
+
+	cfg.checkOneLeader()
+
+	iters := 10
+	for ii := 1; ii < iters; ii++ {
+		// disconnect three nodes
+		i1 := rand.Int() % servers
+		i2 := rand.Int() % servers
+		i3 := rand.Int() % servers
+		_, _ = DPrintf("Test (2A) round %d, disconnect %d", ii, i1)
+		cfg.disconnect(i1)
+		_, _ = DPrintf("Test (2A) round %d, disconnect %d", ii, i2)
+
+		cfg.disconnect(i2)
+		_, _ = DPrintf("Test (2A) round %d, disconnect %d", ii, i3)
+
+		cfg.disconnect(i3)
+
+		// either the current leader should still be alive,
+		// or the remaining four should elect a new one.
+		//time.Sleep(3*time.Second)
+		cfg.checkOneLeader()
+
+		_, _ = DPrintf("Test (2A) round %d, reconnect %d", ii, i1)
+		cfg.connect(i1)
+		_, _ = DPrintf("Test (2A) round %d, reconnect %d", ii, i2)
+
+		cfg.connect(i2)
+		_, _ = DPrintf("Test (2A) round %d, reconnect %d", ii, i3)
+
+		cfg.connect(i3)
+		//time.Sleep(3*time.Second)
+	}
+
+	//time.Sleep(10*time.Second)
+	cfg.checkOneLeader()
 
 	cfg.end()
 }

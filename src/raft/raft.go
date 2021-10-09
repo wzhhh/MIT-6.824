@@ -35,11 +35,11 @@ const (
 	Candidate
 	Leader
 
-	minElecTime         = 300 * time.Millisecond
-	maxElecTime         = 600 * time.Millisecond
-	heartbeatTime       = 150 * time.Millisecond
-	polltime            = 200 * time.Millisecond
-	electiontime        = 500 * time.Millisecond
+	minElecTime   = 300 * time.Millisecond
+	maxElecTime   = 600 * time.Millisecond
+	heartbeatTime = 100 * time.Millisecond
+	polltime      = 200 * time.Millisecond
+	electiontime  = 500 * time.Millisecond
 )
 
 //
@@ -77,6 +77,8 @@ type Raft struct {
 
 	currentTerm int
 	votedFor    int // me
+	voteMap map[int]int
+
 	log         []LogEntry
 
 	commitIndex int
@@ -179,13 +181,24 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	rf.lastTime = time.Now()
 	if args.Term < rf.currentTerm {
+		_, _ = DPrintf("[S%d T%d] refuse RequestVote vote for S%d T%d", rf.me, rf.currentTerm, args.CandidateId, args.Term)
 		reply.VoteGranted = false
 		return
 	}
+	//rf.currentTerm = args.Term
 	if (rf.votedFor < 0 || rf.votedFor == args.CandidateId) && args.LastLogTerm >= rf.log[rf.lastApplied].Term {
-		reply.VoteGranted = true
-		rf.votedFor = args.CandidateId
-		_, _ = DPrintf("[S%d T%d] RequestVote vote for %d", rf.me, rf.currentTerm, args.CandidateId)
+		if rf.voteMap[rf.currentTerm] >= 0 {
+			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
+			//rf.lastTime = time.Now()
+			_, _ = DPrintf("[S%d T%d] RequestVote vote for %d", rf.me, rf.currentTerm, args.CandidateId)
+			rf.voteMap[rf.currentTerm]++
+			if rf.currentTerm < args.Term {
+				rf.state = Follower
+				rf.currentTerm = args.Term
+				rf.votedFor = -1
+			}
+		}
 		return
 	}
 }
@@ -208,16 +221,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
+	rf.lastTime = time.Now()
 	if args.Term < rf.currentTerm {
 		reply.Success = false
+		_, _ = DPrintf("[S%d T%d] refuse AppendEntries from S%d T%d", rf.me, rf.currentTerm, args.LeaderId, args.Term)
+
 		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
 	}
 	if len(args.Entries) == 0 {
 		reply.Success = true
 		rf.state = Follower
-		rf.lastTime = time.Now()
-		_, _ = DPrintf("[S%d T%d] get AppendEntries from S%d T%d, become follower", rf.me, rf.currentTerm, args.LeaderId, args.Term)
-		rf.currentTerm = args.Term
+		//rf.lastTime = time.Now()
+		_, _ = DPrintf("[S%d T%d] Follower get AppendEntries from S%d T%d, become follower", rf.me, rf.currentTerm, args.LeaderId, args.Term)
+		//rf.currentTerm = args.Term
+		//rf.lastTime = time.Now()
 		return
 	}
 	_, _ = DPrintf("[S%d T%d] AppendEntries not match", rf.me, rf.currentTerm)
@@ -322,7 +343,7 @@ func (rf *Raft) convertToCandidate(t time.Duration) {
 	rf.state = Candidate
 	rf.lastTime = time.Now()
 	term := rf.currentTerm
-	rf.votedFor = rf.me
+	//rf.votedFor = rf.me
 	rf.mu.Unlock()
 
 	ok := rf.election(term, t)
@@ -330,13 +351,18 @@ func (rf *Raft) convertToCandidate(t time.Duration) {
 		_, _ = DPrintf("[S%d T%d] election fail", rf.me, term)
 		rf.mu.Lock()
 		rf.votedFor = -1
+		rf.state = Follower
 		rf.mu.Unlock()
 		return
 	}
-	//rf.mu.Lock()
-	//rf.votedFor = rf.me
-	//rf.mu.Unlock()
-	rf.convertToLeader()
+	rf.mu.Lock()
+	if rf.state == Follower {
+		rf.votedFor = -1
+		rf.mu.Unlock()
+		return
+	}
+	rf.mu.Unlock()
+	rf.convertToLeader(heartbeatTime)
 }
 
 func (rf *Raft) election(term int, t time.Duration) bool {
@@ -389,18 +415,30 @@ func (rf *Raft) election(term int, t time.Duration) bool {
 			}
 			voted++
 			if voted > len(rf.peers)/2 {
-				_, _ = DPrintf("[S%d T%d] become leader\n", rf.me, term)
+				if maxTerm > term {
+					rf.mu.Lock()
+					rf.currentTerm = maxTerm
+					rf.votedFor = -1
+					//rf.state = Follower
+					_, _ = DPrintf("[S%d T%d] vote response term bigger than now, update to T%d", rf.me, term, maxTerm)
+					rf.mu.Unlock()
+					//resChan <- false
+					//return
+				}
 				resChan <- true
 			}
 		}
-		resChan <- false
-
 		if maxTerm > term {
 			rf.mu.Lock()
 			rf.currentTerm = maxTerm
+			rf.votedFor = -1
 			_, _ = DPrintf("[S%d T%d] vote response term bigger than now, update to T%d", rf.me, term, maxTerm)
+			//rf.state = Follower
 			rf.mu.Unlock()
 		}
+		resChan <- false
+
+
 	}()
 
 	for {
@@ -414,10 +452,10 @@ func (rf *Raft) election(term int, t time.Duration) bool {
 	}
 }
 
-func (rf *Raft) convertToLeader() {
+func (rf *Raft) convertToLeader(timeout time.Duration) {
 	rf.mu.Lock()
 	rf.state = Leader
-	_, _ = DPrintf("[S%d T%d] send heartbeat\n", rf.me, rf.currentTerm)
+	_, _ = DPrintf("[S%d T%d] become leader, send heartbeat\n", rf.me, rf.currentTerm)
 	rf.mu.Unlock()
 
 	go func() {
@@ -435,12 +473,22 @@ func (rf *Raft) convertToLeader() {
 				return
 			}
 			if rf.killed() {
+				rf.mu.Lock()
+				rf.state = Follower
+				rf.currentTerm = 0
+				rf.votedFor = -1
+				rf.voteMap = map[int]int{}
+				rf.mu.Unlock()
 				_, _ = DPrintf("[S%d T%d] exit heartbeat due to killed\n", rf.me, term)
 				return
 			}
-			ok := rf.heartBeat(term)
+			ok, r := rf.heartBeat(term, timeout)
 			if !ok {
 				_, _ = DPrintf("[S%d T%d] heartbeat exit due to higher term response", rf.me, term)
+				return
+			}
+			if r == 0 {
+				_, _ = DPrintf("[S%d T%d] exit heartbeat due to 0 response", rf.me, term)
 				return
 			}
 			time.Sleep(heartbeatTime)
@@ -448,11 +496,13 @@ func (rf *Raft) convertToLeader() {
 	}()
 }
 
-func (rf *Raft) heartBeat(term int) bool {
+func (rf *Raft) heartBeat(term int, timeout time.Duration) (bool, int) {
 	var wg sync.WaitGroup
 	stopChan := make(chan struct{})
 	done := make(chan struct{})
 	defer close(done)
+	//var mu sync.Mutex
+	r := int32(0)
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
@@ -472,38 +522,51 @@ func (rf *Raft) heartBeat(term int) bool {
 
 			ok := rf.sendAppendEntries(i, args, reply)
 			if !ok {
-				_, _ = DPrintf("[S%d T%d] heartbeat fail on S%d", rf.me, term, i)
-				//select {
-				//case <-done:
-				//	return
-				//case stopChan <- struct{}{}:
-				//}
+				select {
+				case <-done:
+					return
+				default:
+					_, _ = DPrintf("[S%d T%d] heartbeat fail on S%d", rf.me, term, i)
+				}
+
+				atomic.StoreInt32(&r, 1)
 				return
 			}
 			if reply.Term > term {
 				rf.mu.Lock()
 				rf.state = Follower
+				rf.currentTerm = reply.Term
+				rf.votedFor = -1
 				//rf.lastTime = time.Now()
-				_, _ = DPrintf("[S%d T%d] heartbeat response term bigger than now, update to T%d", rf.me, term, reply.Term)
 				rf.mu.Unlock()
 				select {
 				case <-done:
 					return
 				case stopChan <- struct{}{}:
+					_, _ = DPrintf("[S%d T%d] heartbeat response term bigger than now, update to T%d", rf.me, term, reply.Term)
 				}
+				atomic.StoreInt32(&r, 1)
 				return
 			}
-
+			atomic.StoreInt32(&r, 1)
 		}(i, term)
 	}
 	go func() {
 		wg.Wait()
 		close(stopChan)
 	}()
-	for range stopChan {
-		return false
+	for {
+		select {
+		case <-time.After(timeout):
+			_, _ = DPrintf("[S%d T%d] heartbeat timeout", rf.me, term)
+			return true, int(atomic.LoadInt32(&r))
+		case _, ok := <-stopChan:
+			if ok {
+				return false, int(atomic.LoadInt32(&r))
+			}
+			return true, int(atomic.LoadInt32(&r))
+		}
 	}
-	return true
 }
 
 //
@@ -528,6 +591,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.state = Follower
 	rf.lastTime = time.Now()
+	rf.voteMap = map[int]int{}
 	rf.log = []LogEntry{{Term: rf.currentTerm}}
 	go func() {
 		t := time.Duration(makeSeed())%(maxElecTime-minElecTime) + minElecTime
@@ -538,6 +602,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			term := rf.currentTerm
 			rf.mu.Unlock()
 			if rf.killed() {
+				rf.mu.Lock()
+				rf.state = Follower
+				rf.currentTerm = 0
+				rf.votedFor = -1
+				rf.voteMap = map[int]int{}
+				rf.mu.Unlock()
 				_, _ = DPrintf("[S%d T%d] exit due to killed\n", rf.me, term)
 				return
 			}
@@ -549,7 +619,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			time.Sleep(t)
 			cur = t
 			t = time.Duration(makeSeed())%(maxElecTime-minElecTime) + minElecTime
-			_, _ = DPrintf("[S%d T%d] daemon ok in interval %v, next %v", rf.me, term, cur, t)
+			_ = cur
+			//_, _ = DPrintf("[S%d T%d] daemon ok in interval %v, next %v", rf.me, term, cur, t)
 		}
 	}()
 
