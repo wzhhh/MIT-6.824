@@ -185,19 +185,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 		return
 	}
+	if rf.currentTerm < args.Term {
+		rf.state = Follower
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+	}
 	//rf.currentTerm = args.Term
 	if (rf.votedFor < 0 || rf.votedFor == args.CandidateId) && args.LastLogTerm >= rf.log[rf.lastApplied].Term {
-		if rf.voteMap[rf.currentTerm] >= 0 {
+		if rf.voteMap[rf.currentTerm] == 0 {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
 			//rf.lastTime = time.Now()
 			_, _ = DPrintf("[S%d T%d] RequestVote vote for %d", rf.me, rf.currentTerm, args.CandidateId)
 			rf.voteMap[rf.currentTerm]++
-			if rf.currentTerm < args.Term {
-				rf.state = Follower
-				rf.currentTerm = args.Term
-				rf.votedFor = -1
-			}
+
 		}
 		return
 	}
@@ -419,7 +420,7 @@ func (rf *Raft) election(term int, t time.Duration) bool {
 					rf.mu.Lock()
 					rf.currentTerm = maxTerm
 					rf.votedFor = -1
-					//rf.state = Follower
+					rf.state = Follower
 					_, _ = DPrintf("[S%d T%d] vote response term bigger than now, update to T%d", rf.me, term, maxTerm)
 					rf.mu.Unlock()
 					//resChan <- false
@@ -433,7 +434,7 @@ func (rf *Raft) election(term int, t time.Duration) bool {
 			rf.currentTerm = maxTerm
 			rf.votedFor = -1
 			_, _ = DPrintf("[S%d T%d] vote response term bigger than now, update to T%d", rf.me, term, maxTerm)
-			//rf.state = Follower
+			rf.state = Follower
 			rf.mu.Unlock()
 		}
 		resChan <- false
