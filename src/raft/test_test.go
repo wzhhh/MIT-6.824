@@ -224,24 +224,30 @@ func TestFailAgree2B(t *testing.T) {
 
 	// disconnect one follower from the network.
 	leader := cfg.checkOneLeader()
+	_, _ = DPrintf("\n disconnect %d \n", (leader + 1) % servers)
 	cfg.disconnect((leader + 1) % servers)
 
 	// the leader and remaining follower should be
 	// able to agree despite the disconnected follower.
 	cfg.one(102, servers-1, false)
 	cfg.one(103, servers-1, false)
+	_, _ = DPrintf("\n sleep election timeout %v \n", RaftElectionTimeout)
 	time.Sleep(RaftElectionTimeout)
+	_, _ = DPrintf("\n sleep election timeout %v end \n", RaftElectionTimeout)
 	cfg.one(104, servers-1, false)
 	cfg.one(105, servers-1, false)
 
 	// re-connect
+	_, _ = DPrintf("\n reconnect %d \n", (leader + 1) % servers)
 	cfg.connect((leader + 1) % servers)
 
 	// the full set of servers should preserve
 	// previous agreements, and be able to agree
 	// on new commands.
 	cfg.one(106, servers, true)
+	_, _ = DPrintf("\n sleep election timeout %v \n", RaftElectionTimeout)
 	time.Sleep(RaftElectionTimeout)
+	_, _ = DPrintf("\n sleep election timeout %v end \n", RaftElectionTimeout)
 	cfg.one(107, servers, true)
 
 	cfg.end()
@@ -399,6 +405,7 @@ loop:
 	cfg.end()
 }
 
+// TODO
 func TestRejoin2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false)
@@ -437,6 +444,7 @@ func TestRejoin2B(t *testing.T) {
 	cfg.end()
 }
 
+// TODO
 func TestBackup2B(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, false)

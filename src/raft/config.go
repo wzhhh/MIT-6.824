@@ -172,6 +172,7 @@ func (cfg *config) start1(i int) {
 			if m.CommandValid == false {
 				// ignore other types of ApplyMsg
 			} else {
+				_, _ = DPrintf("[S%d] receive msg %#v", i, m)
 				v := m.Command
 				cfg.mu.Lock()
 				for j := 0; j < len(cfg.logs); j++ {
@@ -444,6 +445,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			if rf != nil {
 				index1, _, ok := rf.Start(cmd)
 				if ok {
+					_, _ = DPrintf("[S%d] index: %d", starts, index1)
 					index = index1
 					break
 				}
@@ -456,6 +458,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
+				//_, _ = DPrintf("[%d, %v, %v]", nd, cmd1, cmd)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd1 == cmd {
