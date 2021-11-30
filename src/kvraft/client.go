@@ -1,13 +1,33 @@
 package kvraft
 
-import "labrpc"
+import (
+	"labrpc"
+	"sync"
+	"sync/atomic"
+	"time"
+)
 import "crypto/rand"
 import "math/big"
 
-
+const (
+	retryTime = 10 * time.Millisecond
+)
+// Clerk ...
+/*
+If the Clerk sends an RPC to the wrong kvserver, or if it cannot reach the kvserver,
+	the Clerk should re-try by sending to a different kvserver.
+If the key/value service commits the operation to its Raft log (and hence applies the operation to the key/value state machine),
+	the leader reports the result to the Clerk by responding to its RPC.
+If the operation failed to commit (for example, if the leader was replaced),
+	the server reports an error, and the Clerk retries with a different server.
+ */
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	mu sync.Mutex
+	clientId int64 // Clerk client self id
+	seqId int64 // serial id of commands
+	leaderId int // raft leader
 }
 
 func nrand() int64 {
@@ -21,6 +41,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clientId = nrand()
 	return ck
 }
 
@@ -39,7 +60,47 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	args := GetArgs{
+		Key: key,
+	}
+	_, _ = DPrintf("[C%d] request Get key: %s", ck.clientId, key)
+	for {
+		reply := GetReply{}
+		if ck.servers[ck.currentLeader()].Call("KVServer.Get", &args, &reply) {
+			if reply.Err == OK {
+				_, _ = DPrintf("[C%d] response %s Get key: %s, val: %s", ck.clientId, reply.Err, key, reply.Value)
+				return reply.Value
+			} else if reply.Err == ErrNoKey {
+				_, _ = DPrintf("[C%d] response %s Get key: %s, val: %s", ck.clientId, reply.Err, key, reply.Value)
+				return ""
+			}
+		}
+
+		// timeout or not leader, server will reject and supply the most recent leader heard from AppendEntries
+		ck.changeLeader()
+		time.Sleep(retryTime)
+	}
+}
+
+func (ck *Clerk) changeLeader() int {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	ck.leaderId = (ck.leaderId+1)%len(ck.servers)
+	return ck.leaderId
+}
+
+func (ck *Clerk) currentLeader() int {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	return ck.leaderId
+}
+
+func anotherServer(cur, total int) int {
+	res := int(nrand()%int64(total))
+	for res == cur {
+		res = int(nrand()%int64(total))
+	}
+	return res
 }
 
 //
@@ -54,6 +115,25 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{
+		Key: key,
+		Value: value,
+		Op: op,
+		ClientId: ck.clientId,
+		SeqId: atomic.AddInt64(&ck.seqId, 1),
+	}
+	_, _ = DPrintf("[C%d] request %s key: %s, val: %s, seq: %d", ck.clientId, op, key, value, args.SeqId)
+	for {
+		reply := PutAppendReply{}
+		if ck.servers[ck.currentLeader()].Call("KVServer.PutAppend", &args, &reply) {
+			if reply.Err == OK {
+				_, _ = DPrintf("[C%d] response %s Ok key: %s, val: %s, seq: %d", ck.clientId, op, key, value, args.SeqId)
+				return
+			}
+		}
+		ck.changeLeader()
+		time.Sleep(retryTime)
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

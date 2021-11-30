@@ -67,6 +67,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm int
 }
 
 //
@@ -437,6 +438,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Msg: ApplyMsg{
 			Command:      command,
 			CommandIndex: index,
+			CommandTerm: term,
 		},
 		Term: term,
 	})
@@ -871,6 +873,8 @@ func (rf *Raft) triggerApplyMsg(applyCh chan ApplyMsg) {
 			return
 		}
 
+		applyMsgs := make([]ApplyMsg, 0)
+
 		rf.mu.Lock()
 		isLeader := rf.state == Leader
 		term := rf.CurrentTerm
@@ -901,31 +905,39 @@ func (rf *Raft) triggerApplyMsg(applyCh chan ApplyMsg) {
 			}
 		}
 
-		committed := false
+		//committed := false
 		for rf.lastApplied < rf.commitIndex {
 			_, _ = DPrintf("[S%d T%d] apply Log, lastApplied: %d, commitIndex: %d", rf.me, term, rf.lastApplied, rf.commitIndex)
 
 			rf.lastApplied++
-			rf.Log[rf.lastApplied].Msg.CommandValid = true
-			committed = true
+			//rf.Log[rf.lastApplied].Msg.CommandValid = true
+			//committed = true
 			msg := ApplyMsg{
-				CommandValid: rf.Log[rf.lastApplied].Msg.CommandValid,
+				CommandValid: true,
 				Command:      rf.Log[rf.lastApplied].Msg.Command,
 				CommandIndex: rf.Log[rf.lastApplied].Msg.CommandIndex,
+				CommandTerm: rf.Log[rf.lastApplied].Msg.CommandTerm,
 			}
+			applyMsgs = append(applyMsgs, msg)
 
-			select {
-			case <-time.After(10 * time.Millisecond):
-				_, _ = DPrintf("[S%d T%d] send msg back to applyCh timeout, %v", rf.me, term, rf.Log[rf.lastApplied].Msg)
-				break
-			case applyCh <- msg:
-				_, _ = DPrintf("[S%d T%d] send msg back to applyCh, %v", rf.me, term, msg)
-			}
+			//select {
+			//case <-time.After(10 * time.Millisecond):
+			//	_, _ = DPrintf("[S%d T%d] send msg back to applyCh timeout, %v", rf.me, term, rf.Log[rf.lastApplied].Msg)
+			//	break
+			//case applyCh <- msg:
+			//	_, _ = DPrintf("[S%d T%d] send msg back to applyCh, %v", rf.me, term, msg)
+			//	//log.Printf("[S%d %d] commit msg: %v", rf.me, term, msg)
+			//}
 		}
-		if committed {
-			rf.persist()
-		}
+		//if committed {
+		//	rf.persist()
+		//}
 		rf.mu.Unlock()
+		for _, msg := range applyMsgs {
+			_, _ = DPrintf("[S%d T%d] send msg back to applyCh, %v", rf.me, term, msg)
+			//log.Printf("[S%d %d] commit msg: %#v", rf.me, term, msg)
+			applyCh <- msg
+		}
 
 		//_, _ = DPrintf("[S%d T%d] triggerApplyMsg sleep", rf.me, term)
 		time.Sleep(replyMsgInterval)
@@ -959,7 +971,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.commitIndex = 0
 	rf.Log = []LogEntry{{Term: rf.CurrentTerm, Msg: ApplyMsg{
-		CommandValid: true,
+		CommandValid: false,
 		Command:      nil,
 		CommandIndex: rf.lastApplied,
 	}}}

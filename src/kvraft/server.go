@@ -5,11 +5,17 @@ import (
 	"labrpc"
 	"log"
 	"raft"
+	"reflect"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
-const Debug = 0
+const (
+	Debug = 0
+
+	serverTTL = 2000 * time.Millisecond
+)
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -18,16 +24,42 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Index    int    // log index
+	Term     int    // log term
+	Type     string // PutAppend, Get
+	Key      string
+	Value    string
+	SeqId    int64
+	ClientId int64
+}
+
+// Op context used to wake locked RPC in waiting Raft to commit
+type OpContext struct {
+	op       Op
+	commitCh chan struct{} // notify channel once committed
+
+	wrongLeader bool // index log term not identical
+	stale       bool // seqId smaller
+
+	keyExist bool // for get
+	value    string
+}
+
+func newOpContext(op Op) *OpContext {
+	opCtx := &OpContext{
+		op:       op,
+		commitCh: make(chan struct{}),
+	}
+	return opCtx
 }
 
 type KVServer struct {
 	mu      sync.Mutex
-	me      int
+	me      int // index of the current server in servers[]
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
@@ -35,15 +67,178 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	kvStore map[string]string
+	reqMap  map[int]*OpContext // log index -> context
+	seqMap  map[int64]int64    // clientId -> segId
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	reply.Err = OK
+	op := Op{
+		Type:     TypeGet,
+		Key:      args.Key,
+		SeqId:    args.SeqId,
+		ClientId: args.ClientId,
+	}
+
+	var isLeader bool
+	op.Index, op.Term, isLeader = kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	opCtx := newOpContext(op)
+	kv.mu.Lock()
+	kv.reqMap[op.Index] = opCtx
+	kv.mu.Unlock()
+
+	defer func() {
+		kv.mu.Lock()
+		if one, ok := kv.reqMap[op.Index]; ok {
+			if one == opCtx {
+				delete(kv.reqMap, op.Index)
+			}
+		}
+		kv.mu.Unlock()
+	}()
+
+	select {
+	case <-opCtx.commitCh:
+		if opCtx.wrongLeader {
+			reply.Err = ErrWrongLeader
+		} else if !opCtx.keyExist {
+			reply.Err = ErrNoKey
+		} else {
+			reply.Value = opCtx.value
+		}
+	case <-time.After(serverTTL):
+		reply.Err = ErrWrongLeader
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	defer func() {
+		DPrintf("[S%d] PutAppend reply: %s", kv.me, reply.Err)
+	}()
+	reply.Err = OK
+
+	op := Op{
+		Type:     args.Op,
+		Key:      args.Key,
+		Value:    args.Value,
+		SeqId:    args.SeqId,
+		ClientId: args.ClientId,
+	}
+
+	var isLeader bool
+	op.Index, op.Term, isLeader = kv.rf.Start(op)
+	if !isLeader {
+		DPrintf("[S%d] PutAppend start not leader", kv.me)
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	DPrintf("[S%d] PutAppend op: %#v", kv.me, op)
+	opCtx := newOpContext(op)
+	kv.mu.Lock()
+	kv.reqMap[op.Index] = opCtx
+	kv.mu.Unlock()
+
+	defer func() {
+		kv.mu.Lock()
+		if one, ok := kv.reqMap[op.Index]; ok {
+			if one == opCtx {
+				delete(kv.reqMap, op.Index)
+			}
+		}
+		kv.mu.Unlock()
+	}()
+
+	select {
+	case <-opCtx.commitCh:
+		if opCtx.wrongLeader {
+			DPrintf("[S%d] PutAppend commit wrong leader", kv.me)
+			reply.Err = ErrWrongLeader
+		} else if opCtx.stale {
+			// do nothiing
+		}
+	case <-time.After(serverTTL):
+		DPrintf("[S%d] PutAppend timeout", kv.me)
+		reply.Err = ErrWrongLeader
+	}
+}
+
+func (kv *KVServer) notifyCommit() {
+	for !kv.killed() {
+		for msg := range kv.applyCh {
+
+			//_, _ = DPrintf("[notifyCommit] [S%d] receive commit msg %v", kv.me, msg)
+			func (){
+				cmd := msg.Command
+				index := msg.CommandIndex
+				kv.mu.Lock()
+				defer kv.mu.Unlock()
+
+				op, ok := cmd.(Op)
+				if !ok {
+					_, _ = DPrintf("[notifyCommit] [S%d] wrong type(%v) msg %v", kv.me, reflect.TypeOf(cmd).String(), msg)
+					return
+				}
+				//opCtx, existOp := kv.reqMap[op.Index]
+				opCtx, existOp := kv.reqMap[index]
+				prevSeq, existSeq := kv.seqMap[op.ClientId]
+
+				//DPrintf("[------------notifyCommit S%d] op: %#v, opCtx: %#v, seqMap: %v", kv.me, op, opCtx, kv.seqMap)
+
+				if prevSeq < op.SeqId {
+					kv.seqMap[op.ClientId] = op.SeqId
+				}
+
+				defer func() {
+					if existOp {
+						close(kv.reqMap[index].commitCh)
+					}
+				}()
+
+				if existOp {
+					if opCtx.op.Term != msg.CommandTerm {
+						kv.reqMap[index].wrongLeader = true
+					}
+				}
+
+				switch op.Type {
+				case TypeGet:
+					if existOp {
+						//opCtx.keyExist = true
+						//opCtx.value = kv.kvStore[op.Key]
+
+						kv.reqMap[index].value, kv.reqMap[index].keyExist = kv.kvStore[op.Key]
+					}
+				case TypePut, TypeAppend:
+					//DPrintf("[notifyCommit S%d] put exist seq: %v op.seq: %v, prevSeq: %v, existOp: %v, key-val: %s-%s",
+					//	kv.me, existSeq, op.SeqId, prevSeq, existOp, op.Key, op.Value)
+					if !existSeq || op.SeqId > prevSeq {
+						if op.Type == TypePut {
+							kv.kvStore[op.Key] = op.Value
+						} else if op.Type == TypeAppend {
+							if val, exist := kv.kvStore[op.Key]; exist {
+								kv.kvStore[op.Key] = val+op.Value
+							} else {
+								kv.kvStore[op.Key] = op.Value
+							}
+						}
+					} else if existOp {
+						kv.reqMap[index].stale = true
+					}
+				}
+				_, _ = DPrintf("[notifyCommit] [S%d] %6s kvStore[%v], %v, opCtx: %#v",
+					kv.me, op.Type, kv.kvStore, reflect.TypeOf(cmd).String(), kv.reqMap[index])
+			}()
+		}
+	}
 }
 
 //
@@ -96,6 +291,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.kvStore = map[string]string{}
+	kv.reqMap = map[int]*OpContext{}
+	kv.seqMap = map[int64]int64{}
+
+	go kv.notifyCommit()
 
 	return kv
 }
