@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"labgob"
 	"labrpc"
 	"log"
@@ -15,6 +16,7 @@ const (
 	Debug = 0
 
 	serverTTL = 2000 * time.Millisecond
+	snapshotTime = 10 * time.Millisecond
 )
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -67,9 +69,11 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	kvStore map[string]string
+	KvStore map[string]string
 	reqMap  map[int]*OpContext // log index -> context
-	seqMap  map[int64]int64    // clientId -> segId
+	SeqMap  map[int64]int64    // clientId -> segId
+
+	lastAppliedIndex int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -174,13 +178,32 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) notifyCommit() {
 	for !kv.killed() {
 		for msg := range kv.applyCh {
-
+			if !msg.CommandValid {
+				kv.mu.Lock()
+				if len(msg.Snapshot) == 0 {
+					// empty snapshot, clear data
+					kv.KvStore = make(map[string]string)
+					kv.SeqMap = make(map[int64]int64)
+				} else {
+					r := bytes.NewBuffer(msg.Snapshot)
+					d := labgob.NewDecoder(r)
+					d.Decode(&kv.KvStore)
+					d.Decode(&kv.SeqMap)
+				}
+				kv.lastAppliedIndex = msg.LastIncludedIndex
+				_, _ = DPrintf("[notifyCommit] [S%d] installSnapshot, kvStore[%v], seqMap[%v], lastAppliedIndex[%v]",
+					kv.me, len(kv.KvStore), len(kv.SeqMap), kv.lastAppliedIndex)
+				kv.mu.Unlock()
+				continue
+			}
 			//_, _ = DPrintf("[notifyCommit] [S%d] receive commit msg %v", kv.me, msg)
 			func (){
 				cmd := msg.Command
 				index := msg.CommandIndex
 				kv.mu.Lock()
 				defer kv.mu.Unlock()
+
+				kv.lastAppliedIndex = index
 
 				op, ok := cmd.(Op)
 				if !ok {
@@ -189,12 +212,12 @@ func (kv *KVServer) notifyCommit() {
 				}
 				//opCtx, existOp := kv.reqMap[op.Index]
 				opCtx, existOp := kv.reqMap[index]
-				prevSeq, existSeq := kv.seqMap[op.ClientId]
+				prevSeq, existSeq := kv.SeqMap[op.ClientId]
 
-				//DPrintf("[------------notifyCommit S%d] op: %#v, opCtx: %#v, seqMap: %v", kv.me, op, opCtx, kv.seqMap)
+				//DPrintf("[------------notifyCommit S%d] op: %#v, opCtx: %#v, SeqMap: %v", kv.me, op, opCtx, kv.SeqMap)
 
 				if prevSeq < op.SeqId {
-					kv.seqMap[op.ClientId] = op.SeqId
+					kv.SeqMap[op.ClientId] = op.SeqId
 				}
 
 				defer func() {
@@ -213,33 +236,59 @@ func (kv *KVServer) notifyCommit() {
 				case TypeGet:
 					if existOp {
 						//opCtx.keyExist = true
-						//opCtx.value = kv.kvStore[op.Key]
+						//opCtx.value = kv.KvStore[op.Key]
 
-						kv.reqMap[index].value, kv.reqMap[index].keyExist = kv.kvStore[op.Key]
+						kv.reqMap[index].value, kv.reqMap[index].keyExist = kv.KvStore[op.Key]
 					}
 				case TypePut, TypeAppend:
 					//DPrintf("[notifyCommit S%d] put exist seq: %v op.seq: %v, prevSeq: %v, existOp: %v, key-val: %s-%s",
 					//	kv.me, existSeq, op.SeqId, prevSeq, existOp, op.Key, op.Value)
 					if !existSeq || op.SeqId > prevSeq {
 						if op.Type == TypePut {
-							kv.kvStore[op.Key] = op.Value
+							kv.KvStore[op.Key] = op.Value
 						} else if op.Type == TypeAppend {
-							if val, exist := kv.kvStore[op.Key]; exist {
-								kv.kvStore[op.Key] = val+op.Value
+							if val, exist := kv.KvStore[op.Key]; exist {
+								kv.KvStore[op.Key] = val+op.Value
 							} else {
-								kv.kvStore[op.Key] = op.Value
+								kv.KvStore[op.Key] = op.Value
 							}
 						}
 					} else if existOp {
 						kv.reqMap[index].stale = true
 					}
 				}
-				_, _ = DPrintf("[notifyCommit] [S%d] %6s kvStore[%v], %v, opCtx: %#v",
-					kv.me, op.Type, kv.kvStore, reflect.TypeOf(cmd).String(), kv.reqMap[index])
+				_, _ = DPrintf("[notifyCommit] [S%d] %6s KvStore[%v], %v, opCtx: %#v",
+					kv.me, op.Type, kv.KvStore, reflect.TypeOf(cmd).String(), kv.reqMap[index])
 			}()
 		}
 	}
 }
+
+func (kv *KVServer) snapshotLoop() {
+	for !kv.killed() {
+		var snapshot []byte
+		var lastIncludedIndex int
+
+		if kv.maxraftstate != -1 && kv.rf.ExceedLogSize(kv.maxraftstate) {
+			kv.mu.Lock()
+			w := new(bytes.Buffer)
+			e := labgob.NewEncoder(w)
+			e.Encode(kv.KvStore)
+			e.Encode(kv.SeqMap)
+			snapshot = w.Bytes()
+			lastIncludedIndex = kv.lastAppliedIndex
+			_, _ = DPrintf("[snapshotLoop] [KS%d] dump snapshot, snapshot size[%d] lastAppliedIndex[%d]",
+				kv.me, len(snapshot), kv.lastAppliedIndex)
+			kv.mu.Unlock()
+		}
+
+		if snapshot != nil {
+			kv.rf.TakeSnapshot(snapshot, lastIncludedIndex)
+		}
+		time.Sleep(snapshotTime)
+	}
+}
+
 
 //
 // the tester calls Kill() when a KVServer instance won't
@@ -287,15 +336,17 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 1)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-	kv.kvStore = map[string]string{}
+	kv.KvStore = map[string]string{}
 	kv.reqMap = map[int]*OpContext{}
-	kv.seqMap = map[int64]int64{}
+	kv.SeqMap = map[int64]int64{}
+	kv.lastAppliedIndex = 0
 
 	go kv.notifyCommit()
+	go kv.snapshotLoop()
 
 	return kv
 }

@@ -630,6 +630,7 @@ func TestSnapshotRPC3B(t *testing.T) {
 	check(cfg, t, ck, "a", "A")
 
 	// a bunch of puts into the majority partition.
+	_, _ = DPrintf("\n\n[TestSnapshotRPC3B] partition to {0, 1}, {2}\n\n")
 	cfg.partition([]int{0, 1}, []int{2})
 	{
 		ck1 := cfg.makeClient([]int{0, 1})
@@ -649,6 +650,8 @@ func TestSnapshotRPC3B(t *testing.T) {
 
 	// now make group that requires participation of
 	// lagging server, so that it has to catch up.
+	_, _ = DPrintf("\n\n[TestSnapshotRPC3B] partition to {0, 2}, {1}\n\n")
+
 	cfg.partition([]int{0, 2}, []int{1})
 	{
 		ck1 := cfg.makeClient([]int{0, 2})
@@ -661,6 +664,8 @@ func TestSnapshotRPC3B(t *testing.T) {
 	}
 
 	// now everybody
+	_, _ = DPrintf("\n\n[TestSnapshotRPC3B] partition to {0, 1, 2}\n\n")
+
 	cfg.partition([]int{0, 1, 2}, []int{})
 
 	Put(cfg, ck, "e", "E")
